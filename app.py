@@ -11,7 +11,9 @@ import audioop
 
 APP_NAME = "Open Sound Pad"
 WIDTH, HEIGHT = 700, 560
-LOCK_FILE = "OSP.lock"
+LOCK_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "OpenSoundPad")
+os.makedirs(LOCK_DIR, exist_ok=True)
+LOCK_FILE = os.path.join(LOCK_DIR, "OSP.lock")
 
 BG = "#0a0d12"
 PANEL = "#0f141c"
