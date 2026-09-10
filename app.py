@@ -9,17 +9,17 @@ import ctypes
 import numpy as np
 import audioop
 
-# ================= CONFIG =================
-APP_NAME = "SoundKey"
-WIDTH, HEIGHT = 275, 640
-LOCK_FILE = "soundkey.lock"
+APP_NAME = "Open Sound Pad"
+WIDTH, HEIGHT = 700, 560
+LOCK_FILE = "OSP.lock"
 
 BG = "#0a0d12"
 PANEL = "#0f141c"
+PANEL2 = "#141b26"
 ACCENT = "#5eead4"
 TEXT = "#e5e7eb"
+DANGER = "#ef4444"
 
-# ================= SINGLE INSTANCE =================
 if os.path.exists(LOCK_FILE):
     try:
         pid = int(open(LOCK_FILE).read())
@@ -29,22 +29,16 @@ if os.path.exists(LOCK_FILE):
         pass
 open(LOCK_FILE, "w").write(str(os.getpid()))
 
-# ================= AUDIO =================
 VIRTUAL_RATE = 48000
 VIRTUAL_CHANNELS = 2
 SAMPLE_WIDTH = 2
 
 pygame.mixer.init(frequency=VIRTUAL_RATE, size=-16, channels=VIRTUAL_CHANNELS)
+pygame.mixer.set_num_channels(32)
 p = pyaudio.PyAudio()
 
-stop_mic_event = False
 stop_passthrough_event = Event()
 audio_lock = Lock()
-is_playing = False
-current_sound = None
-current_path = ""
-start_time = 0
-sound_length = 0
 mic_passthrough_thread = None
 selected_input_device = None
 
@@ -71,7 +65,6 @@ def preferred_input_host_api():
 
 def normalize_device_name(name):
     base = " ".join(name.replace("\t", " ").split())
-    # Strip trailing host tags often shown by PortAudio, e.g. " (...)"
     if base.endswith(")") and " (" in base:
         base = base[:base.rfind(" (")]
     return base.strip().lower()
@@ -170,15 +163,13 @@ def write_to_virtual(raw, in_channels, in_rate, volume):
     with audio_lock:
         virtual_out_stream.write(data)
 
-def play_to_mic(raw):
-    global stop_mic_event
-
-    stop_mic_event = False
+def play_to_mic_slot(slot, raw):
+    """Feed one slot's audio into the virtual mic, chunk by chunk,
+    stopping early if the slot's own stop event is set (interrupt)."""
     chunk_size = 4096
-
     try:
         for i in range(0, len(raw), chunk_size):
-            if stop_mic_event:
+            if slot["mic_stop_event"].is_set():
                 break
             chunk = raw[i:i + chunk_size]
             write_to_virtual(chunk, VIRTUAL_CHANNELS, VIRTUAL_RATE, mic_volume.get())
@@ -216,49 +207,54 @@ def mic_passthrough_loop(device_index):
             in_stream.close()
 
 
-# ================= UI =================
 ctk.set_appearance_mode("dark")
 root = ctk.CTk()
 root.geometry(f"{WIDTH}x{HEIGHT}")
 root.title(APP_NAME)
 root.configure(fg_color=BG)
-root.iconbitmap("newicon.ico") 
+try:
+    root.iconbitmap("newicon.ico")
+except Exception:
+    pass
 
-# ---- Force taskbar presence
 root.overrideredirect(False)
 
-# ================= CONTENT =================
 content = ctk.CTkFrame(root, fg_color=BG)
 content.pack(expand=True, fill="both", padx=20, pady=20)
 
-status = ctk.CTkLabel(content, text="No key bound", text_color=ACCENT)
+left_panel = ctk.CTkFrame(content, fg_color=BG, width=300)
+left_panel.pack(side="left", fill="y", padx=(0, 16))
+left_panel.pack_propagate(False)
+
+right_panel = ctk.CTkFrame(content, fg_color=BG)
+right_panel.pack(side="left", fill="both", expand=True)
+
+status = ctk.CTkLabel(left_panel, text="No key bound", text_color=ACCENT)
 status.pack(pady=6)
 
-# ================= INFO BOX =================
-info_box = ctk.CTkFrame(content, fg_color=PANEL)
+info_box = ctk.CTkFrame(left_panel, fg_color=PANEL)
 info_box.pack(fill="x", pady=8)
 
-info_name = ctk.CTkLabel(info_box, text="Name: —", wraplength=420)
+info_name = ctk.CTkLabel(info_box, text="Name: —", wraplength=260)
 info_name.pack(anchor="w", padx=10, pady=4)
 
-info_path = ctk.CTkLabel(info_box, text="Path: —", text_color="#9ca3af", wraplength=420)
+info_path = ctk.CTkLabel(info_box, text="Path: —", text_color="#9ca3af", wraplength=260)
 info_path.pack(anchor="w", padx=10)
 
 info_time = ctk.CTkLabel(info_box, text="Time: 0.00 / 0.00", text_color=ACCENT)
 info_time.pack(anchor="w", padx=10, pady=4)
 
-# ================= VOLUME =================
-ctk.CTkLabel(content, text="Headphones Volume").pack(anchor="w")
-os_volume = ctk.CTkSlider(content, from_=0.0, to=1.0)
+ctk.CTkLabel(left_panel, text="Headphones Volume").pack(anchor="w")
+os_volume = ctk.CTkSlider(left_panel, from_=0.0, to=1.0)
 os_volume.set(0.7)
 os_volume.pack(fill="x", pady=4)
 
-ctk.CTkLabel(content, text="Mic Volume").pack(anchor="w")
-mic_volume = ctk.CTkSlider(content, from_=0.0, to=1.5)
+ctk.CTkLabel(left_panel, text="Mic Volume").pack(anchor="w")
+mic_volume = ctk.CTkSlider(left_panel, from_=0.0, to=1.5)
 mic_volume.set(1.0)
 mic_volume.pack(fill="x", pady=4)
 
-ctk.CTkLabel(content, text="Input Mic -> Virtual Mic").pack(anchor="w", pady=(6, 0))
+ctk.CTkLabel(left_panel, text="Input Mic -> Virtual Mic").pack(anchor="w", pady=(6, 0))
 input_mics = list_input_mics()
 mic_name_to_index = {f'{m["name"]} [{m["index"]}]': m["index"] for m in input_mics}
 mic_names = list(mic_name_to_index.keys()) if input_mics else ["No input devices"]
@@ -269,7 +265,7 @@ def on_mic_select(choice):
     selected_input_device = mic_name_to_index.get(choice)
 
 ctk.CTkOptionMenu(
-    content,
+    left_panel,
     values=mic_names,
     variable=mic_choice,
     command=on_mic_select
@@ -300,48 +296,148 @@ def toggle_mic_passthrough():
     mic_route_btn.configure(text="Stop Mic Route")
     status.configure(text=f"Routing mic: {mic_choice.get()}")
 
-mic_route_btn = ctk.CTkButton(content, text="Start Mic Route", command=toggle_mic_passthrough)
+mic_route_btn = ctk.CTkButton(left_panel, text="Start Mic Route", command=toggle_mic_passthrough)
 mic_route_btn.pack(pady=6)
 
-# ================= OPTIONS =================
 options = {
     "topmost": tk.BooleanVar(value=False),
-    "notifications": tk.BooleanVar(value=True)
+    "notifications": tk.BooleanVar(value=True),
+    "interrupt_on_replay": tk.BooleanVar(value=False),
 }
 
 def apply_options():
     root.attributes("-topmost", options["topmost"].get())
 
 ctk.CTkCheckBox(
-    content, text="Always on top",
+    left_panel, text="Always on top",
     variable=options["topmost"],
     command=apply_options
 ).pack(anchor="w", pady=4)
 
 ctk.CTkCheckBox(
-    content, text="Show notifications",
+    left_panel, text="Show notifications",
     variable=options["notifications"]
 ).pack(anchor="w")
 
-# ================= SOUNDS =================
-sounds = []
-sound_paths = []
+ctk.CTkCheckBox(
+    left_panel, text="Interrupt when pressing keybind again",
+    variable=options["interrupt_on_replay"]
+).pack(anchor="w", pady=(4, 8))
 
-def browse():
-    from tkinter import filedialog
-    paths = filedialog.askopenfilenames(filetypes=[("Audio", "*.wav *.mp3 *.ogg")])
-    sounds.clear()
-    sound_paths.clear()
+ctk.CTkButton(left_panel, text="Stop", fg_color=DANGER, command=lambda: stop_all()).pack(pady=8, fill="x")
 
-    for pth in paths:
-        sounds.append(pygame.mixer.Sound(pth))
-        sound_paths.append(pth)
+sound_slots = []
+key_bindings = {}
+last_played_slot = None
+_next_slot_id = 0
 
-    status.configure(text=f"{len(sounds)} sounds loaded")
+def format_key(k):
+    try:
+        if hasattr(k, "char") and k.char:
+            return k.char.upper()
+    except Exception:
+        pass
+    return str(k).replace("Key.", "")
 
-ctk.CTkButton(content, text="Load Sounds", command=browse).pack(pady=8)
+ctk.CTkLabel(right_panel, text="Sound Slots (key -> sound)").pack(anchor="w", pady=(4, 0))
 
-# ================= NOTIFICATION =================
+add_slot_btn_holder = ctk.CTkFrame(right_panel, fg_color=BG)
+add_slot_btn_holder.pack(fill="x", pady=(4, 6))
+
+slots_frame = ctk.CTkScrollableFrame(right_panel, fg_color=PANEL)
+slots_frame.pack(fill="both", expand=True, pady=(0, 6))
+
+def rebuild_key_bindings():
+    """Recompute the key->slot map from the current slot list."""
+    key_bindings.clear()
+    for slot in sound_slots:
+        if slot["key"] is not None:
+            key_bindings[slot["key"]] = slot
+
+def make_slot_row(slot):
+    row = ctk.CTkFrame(slots_frame, fg_color=PANEL2)
+    row.pack(fill="x", pady=4, padx=4)
+
+    label = ctk.CTkLabel(
+        row,
+        text=f'{slot["name"]}   [{format_key(slot["key"]) if slot["key"] else "unbound"}]',
+        anchor="w", justify="left", wraplength=190
+    )
+    label.pack(side="left", padx=6, pady=6, fill="x", expand=True)
+    slot["label"] = label
+
+    def do_load():
+        from tkinter import filedialog
+        pth = filedialog.askopenfilename(filetypes=[("Audio", "*.wav *.mp3 *.ogg")])
+        if not pth:
+            return
+        try:
+            slot["sound"] = pygame.mixer.Sound(pth)
+        except Exception as e:
+            status.configure(text=f"Couldn't load sound: {e}")
+            return
+        slot["path"] = pth
+        slot["name"] = os.path.basename(pth)
+        refresh_label(slot)
+        status.configure(text=f'Loaded "{slot["name"]}"')
+
+    def do_bind():
+        status.configure(text="Press any key...")
+
+        def once(k):
+            for s in sound_slots:
+                if s is not slot and s["key"] == k:
+                    s["key"] = None
+                    refresh_label(s)
+            slot["key"] = k
+            rebuild_key_bindings()
+            refresh_label(slot)
+            status.configure(text=f"Bound {format_key(k)} -> {slot['name']}")
+            return False  
+
+        keyboard.Listener(on_press=once).start()
+
+    def do_remove():
+        stop_slot(slot)
+        sound_slots.remove(slot)
+        rebuild_key_bindings()
+        row.destroy()
+        status.configure(text=f'Removed "{slot["name"]}"')
+
+    ctk.CTkButton(row, text="Load", width=56, command=do_load).pack(side="left", padx=2, pady=6)
+    ctk.CTkButton(row, text="Bind", width=56, command=do_bind).pack(side="left", padx=2, pady=6)
+    ctk.CTkButton(row, text="✕", width=28, fg_color=DANGER, command=do_remove).pack(side="left", padx=(2, 6), pady=6)
+
+    slot["row"] = row
+
+def refresh_label(slot):
+    slot["label"].configure(
+        text=f'{slot["name"]}   [{format_key(slot["key"]) if slot["key"] else "unbound"}]'
+    )
+
+def add_slot():
+    global _next_slot_id
+    _next_slot_id += 1
+    slot = {
+        "id": _next_slot_id,
+        "name": "No sound loaded",
+        "path": "",
+        "sound": None,
+        "key": None,
+        "channel": None,
+        "mic_stop_event": Event(),
+        "start_time": 0,
+        "length": 0,
+        "label": None,
+        "row": None,
+    }
+    sound_slots.append(slot)
+    make_slot_row(slot)
+
+ctk.CTkButton(add_slot_btn_holder, text="+ Add Sound Slot", command=add_slot).pack(fill="x")
+
+add_slot()
+
 notify = None
 
 def show_notification(text):
@@ -349,7 +445,7 @@ def show_notification(text):
     if not options["notifications"].get():
         return
     if notify:
-        return
+        close_notification()
 
     notify = ctk.CTkToplevel(root)
     notify.overrideredirect(True)
@@ -364,80 +460,72 @@ def close_notification():
         notify.destroy()
         notify = None
 
-# ================= PLAY =================
-def play_sound():
-    global current_sound, current_path, start_time, sound_length, is_playing
+def stop_slot(slot):
+    if slot["channel"] is not None:
+        try:
+            slot["channel"].stop()
+        except Exception:
+            pass
+    slot["mic_stop_event"].set()
 
-    if not sounds or pygame.mixer.get_busy():
+def play_slot(slot):
+    global last_played_slot
+
+    if slot["sound"] is None:
+        status.configure(text=f'"{slot["name"]}" has no sound loaded')
         return
 
-    idx = random.randrange(len(sounds))
-    current_sound = sounds[idx]
-    current_path = sound_paths[idx]
+    already_playing = slot["channel"] is not None and slot["channel"].get_busy()
 
-    current_sound.set_volume(os_volume.get())
-    current_sound.play()
+    if already_playing:
+        if options["interrupt_on_replay"].get():
+            stop_slot(slot)
+        return
 
-    raw = current_sound.get_raw()
-    Thread(target=play_to_mic, args=(raw,), daemon=True).start()
+    slot["sound"].set_volume(os_volume.get())
+    channel = slot["sound"].play()
+    slot["channel"] = channel
 
-    start_time = time.time()
-    sound_length = current_sound.get_length()
-    is_playing = True
+    slot["mic_stop_event"].clear()
+    raw = slot["sound"].get_raw()
+    Thread(target=play_to_mic_slot, args=(slot, raw), daemon=True).start()
 
-    info_name.configure(text=f"Name: {os.path.basename(current_path)}")
-    info_path.configure(text=f"Path: {current_path}")
+    slot["start_time"] = time.time()
+    slot["length"] = slot["sound"].get_length()
+    last_played_slot = slot
 
-    show_notification(f"▶ {os.path.basename(current_path)}")
+    info_name.configure(text=f'Name: {slot["name"]}')
+    info_path.configure(text=f'Path: {slot["path"]}')
 
-def stop_sound():
-    global is_playing, stop_mic_event
-    stop_mic_event = True
-    pygame.mixer.stop()
-    is_playing = False
+    show_notification(f'▶ {slot["name"]}')
+
+def stop_all():
+    for slot in sound_slots:
+        stop_slot(slot)
     close_notification()
 
-ctk.CTkButton(content, text="Stop", fg_color="#ef4444", command=stop_sound).pack(pady=8)
-
-# ================= TIME UPDATE =================
 def update_time():
-    global is_playing, stop_mic_event
-    if pygame.mixer.get_busy():
-        pos = time.time() - start_time
-        info_time.configure(text=f"Time: {pos:.2f} / {sound_length:.2f}")
+    if last_played_slot and last_played_slot["channel"] is not None and last_played_slot["channel"].get_busy():
+        pos = time.time() - last_played_slot["start_time"]
+        info_time.configure(text=f'Time: {pos:.2f} / {last_played_slot["length"]:.2f}')
     else:
-        if is_playing:
-         is_playing = False
-         stop_mic_event = True
-        close_notification()
+        if not any(s["channel"] is not None and s["channel"].get_busy() for s in sound_slots):
+            close_notification()
     root.after(100, update_time)
 
 update_time()
 
-# ================= KEY BIND =================
-selected_key = None
-
-def bind_key():
-    status.configure(text="Press any key...")
-
-    def once(k):
-        global selected_key
-        selected_key = k
-        status.configure(text=f"Bound to {k}")
-        return False
-
-    keyboard.Listener(on_press=once).start()
-
 def on_key(k):
-    if k == selected_key:
-        play_sound()
+    slot = key_bindings.get(k)
+    if slot:
+        play_slot(slot)
 
-ctk.CTkButton(content, text="Bind Key", command=bind_key).pack(pady=6)
 keyboard.Listener(on_press=on_key).start()
 
-# ================= CLEANUP =================
 def cleanup():
     stop_passthrough_event.set()
+    for slot in sound_slots:
+        slot["mic_stop_event"].set()
     try:
         virtual_out_stream.stop_stream()
         virtual_out_stream.close()
