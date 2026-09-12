@@ -13,13 +13,15 @@ import zipfile
 import shutil
 
 APP_NAME = "Open Sound Pad"
-WIDTH, HEIGHT = 700, 620
+WIDTH, HEIGHT = 800, 620
 LOCK_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "OpenSoundPad")
 os.makedirs(LOCK_DIR, exist_ok=True)
 LOCK_FILE = os.path.join(LOCK_DIR, "OSP.lock")
 CONFIG_FILE = os.path.join(LOCK_DIR, "config.json")
 PRESET_CACHE_DIR = os.path.join(LOCK_DIR, "preset_cache")
 PRESET_EXT = ".ospad"
+PRESETS_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "OpenSoundPad", "presets")
+os.makedirs(PRESETS_DIR, exist_ok=True)
 
 BG = "#0a0d12"
 PANEL = "#0f141c"
@@ -50,7 +52,6 @@ audio_lock = Lock()
 mic_passthrough_thread = None
 selected_input_device = None
 
-
 def load_app_config():
     if os.path.exists(CONFIG_FILE):
         try:
@@ -68,16 +69,15 @@ def save_app_config(cfg):
     except Exception:
         pass
 
-
 def find_virtual_outputs():
     """Find candidate virtual audio devices we can write mixed audio into so
     it shows up as a virtual microphone elsewhere. Supports VB-Audio Virtual
     Cable and VB-Audio Voicemeeter (Standard/Banana/Potato)."""
     known_tokens = [
         "cable input",
-        "voicemeeter input",   
-        "voicemeeter aux input",  
-        "voicemeeter vaio3 input",  
+        "voicemeeter input",
+        "voicemeeter aux input",
+        "voicemeeter vaio3 input",
     ]
     candidates = []
     seen = set()
@@ -284,7 +284,6 @@ def mic_passthrough_loop(device_index):
         if in_stream is not None:
             in_stream.stop_stream()
             in_stream.close()
-
 
 def serialize_key(k):
     if k is None:
@@ -662,7 +661,6 @@ def update_time():
 
 update_time()
 
-
 def save_preset(path):
     manifest = {"slots": []}
     try:
@@ -759,7 +757,8 @@ def save_preset_dialog():
     from tkinter import filedialog
     path = filedialog.asksaveasfilename(
         defaultextension=PRESET_EXT,
-        filetypes=[("Open Sound Pad Preset", f"*{PRESET_EXT}")]
+        filetypes=[("Open Sound Pad Preset", f"*{PRESET_EXT}")],
+        initialdir=PRESETS_DIR
     )
     if not path:
         return
@@ -768,7 +767,8 @@ def save_preset_dialog():
 def load_preset_dialog():
     from tkinter import filedialog
     path = filedialog.askopenfilename(
-        filetypes=[("Open Sound Pad Preset", f"*{PRESET_EXT}")]
+        filetypes=[("Open Sound Pad Preset", f"*{PRESET_EXT}")],
+        initialdir=PRESETS_DIR
     )
     if not path:
         return
