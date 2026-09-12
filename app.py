@@ -8,12 +8,18 @@ import os, sys, random, psutil, time
 import ctypes
 import numpy as np
 import audioop
+import json
+import zipfile
+import shutil
 
 APP_NAME = "Open Sound Pad"
-WIDTH, HEIGHT = 700, 560
+WIDTH, HEIGHT = 700, 620
 LOCK_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "OpenSoundPad")
 os.makedirs(LOCK_DIR, exist_ok=True)
 LOCK_FILE = os.path.join(LOCK_DIR, "OSP.lock")
+CONFIG_FILE = os.path.join(LOCK_DIR, "config.json")
+PRESET_CACHE_DIR = os.path.join(LOCK_DIR, "preset_cache")
+PRESET_EXT = ".ospad"
 
 BG = "#0a0d12"
 PANEL = "#0f141c"
@@ -44,13 +50,99 @@ audio_lock = Lock()
 mic_passthrough_thread = None
 selected_input_device = None
 
-def find_cable_input():
+
+def load_app_config():
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def save_app_config(cfg):
+    try:
+        with open(CONFIG_FILE, "w") as f:
+            json.dump(cfg, f)
+    except Exception:
+        pass
+
+
+def find_virtual_outputs():
+    """Find candidate virtual audio devices we can write mixed audio into so
+    it shows up as a virtual microphone elsewhere. Supports VB-Audio Virtual
+    Cable and VB-Audio Voicemeeter (Standard/Banana/Potato)."""
+    known_tokens = [
+        "cable input",
+        "voicemeeter input",   
+        "voicemeeter aux input",  
+        "voicemeeter vaio3 input",  
+    ]
+    candidates = []
+    seen = set()
     for i in range(p.get_device_count()):
         info = p.get_device_info_by_index(i)
-        if "cable input" in info.get("name", "").lower():
-            if info["maxOutputChannels"] > 0:
-                return i
-    return None
+        name = info.get("name", "")
+        low = name.lower()
+        if info.get("maxOutputChannels", 0) <= 0:
+            continue
+        for token in known_tokens:
+            if token in low and i not in seen:
+                candidates.append({"index": i, "name": name})
+                seen.add(i)
+                break
+    return candidates
+
+
+def open_virtual_stream(device_index):
+    global virtual_out_stream
+    with audio_lock:
+        try:
+            virtual_out_stream.stop_stream()
+            virtual_out_stream.close()
+        except Exception:
+            pass
+        virtual_out_stream = p.open(
+            format=pyaudio.paInt16,
+            channels=VIRTUAL_CHANNELS,
+            rate=VIRTUAL_RATE,
+            output=True,
+            output_device_index=device_index,
+            frames_per_buffer=1024
+        )
+
+
+_app_cfg = load_app_config()
+virtual_outputs = find_virtual_outputs()
+if not virtual_outputs:
+    sys.exit(
+        "No virtual audio input device found. Install VB-Audio Virtual Cable "
+        "or VB-Audio Voicemeeter (Standard/Banana/Potato) and try again."
+    )
+
+_saved_output_index = _app_cfg.get("virtual_output_device")
+CABLE_DEVICE = None
+if _saved_output_index is not None:
+    for d in virtual_outputs:
+        if d["index"] == _saved_output_index:
+            CABLE_DEVICE = _saved_output_index
+            break
+if CABLE_DEVICE is None:
+    CABLE_DEVICE = virtual_outputs[0]["index"]
+
+try:
+    virtual_out_stream = p.open(
+        format=pyaudio.paInt16,
+        channels=VIRTUAL_CHANNELS,
+        rate=VIRTUAL_RATE,
+        output=True,
+        output_device_index=CABLE_DEVICE,
+        frames_per_buffer=1024
+    )
+except Exception as e:
+    sys.exit(f"Failed to open virtual output stream: {e}")
+
 
 def preferred_input_host_api():
     preferred_order = ["wasapi", "wdm-ks", "directsound", "mme"]
@@ -117,21 +209,6 @@ def list_input_mics():
     devices.sort(key=lambda d: ("realtek" not in d["name"].lower(), d["name"].lower()))
     return devices
 
-CABLE_DEVICE = find_cable_input()
-if CABLE_DEVICE is None:
-    sys.exit("VB-Audio Cable not found")
-
-try:
-    virtual_out_stream = p.open(
-        format=pyaudio.paInt16,
-        channels=VIRTUAL_CHANNELS,
-        rate=VIRTUAL_RATE,
-        output=True,
-        output_device_index=CABLE_DEVICE,
-        frames_per_buffer=1024
-    )
-except Exception as e:
-    sys.exit(f"Failed to open VB-Cable output stream: {e}")
 
 def scale_pcm(raw, volume):
     pcm = np.frombuffer(raw, dtype=np.int16)
@@ -209,6 +286,32 @@ def mic_passthrough_loop(device_index):
             in_stream.close()
 
 
+def serialize_key(k):
+    if k is None:
+        return None
+    if isinstance(k, keyboard.KeyCode):
+        return {"type": "char", "char": k.char, "vk": k.vk}
+    if isinstance(k, keyboard.Key):
+        return {"type": "special", "name": k.name}
+    return None
+
+def deserialize_key(d):
+    if not d:
+        return None
+    try:
+        if d.get("type") == "char":
+            if d.get("char"):
+                return keyboard.KeyCode.from_char(d["char"])
+            if d.get("vk") is not None:
+                return keyboard.KeyCode.from_vk(d["vk"])
+            return None
+        if d.get("type") == "special":
+            return getattr(keyboard.Key, d.get("name"), None)
+    except Exception:
+        return None
+    return None
+
+
 ctk.set_appearance_mode("dark")
 root = ctk.CTk()
 root.geometry(f"{WIDTH}x{HEIGHT}")
@@ -255,6 +358,37 @@ ctk.CTkLabel(left_panel, text="Mic Volume").pack(anchor="w")
 mic_volume = ctk.CTkSlider(left_panel, from_=0.0, to=1.5)
 mic_volume.set(1.0)
 mic_volume.pack(fill="x", pady=4)
+
+ctk.CTkLabel(left_panel, text="Virtual Output (VB-Cable / Voicemeeter)").pack(anchor="w", pady=(6, 0))
+virtual_output_name_to_index = {f'{d["name"]} [{d["index"]}]': d["index"] for d in virtual_outputs}
+virtual_output_names = list(virtual_output_name_to_index.keys())
+_current_output_label = next(
+    (label for label, idx in virtual_output_name_to_index.items() if idx == CABLE_DEVICE),
+    virtual_output_names[0]
+)
+virtual_output_choice = tk.StringVar(value=_current_output_label)
+
+def on_virtual_output_select(choice):
+    global CABLE_DEVICE
+    idx = virtual_output_name_to_index.get(choice)
+    if idx is None or idx == CABLE_DEVICE:
+        return
+    try:
+        open_virtual_stream(idx)
+        CABLE_DEVICE = idx
+        cfg = load_app_config()
+        cfg["virtual_output_device"] = idx
+        save_app_config(cfg)
+        status.configure(text=f"Output routed to: {choice}")
+    except Exception as e:
+        status.configure(text=f"Failed to switch output device: {e}")
+
+ctk.CTkOptionMenu(
+    left_panel,
+    values=virtual_output_names,
+    variable=virtual_output_choice,
+    command=on_virtual_output_select
+).pack(fill="x", pady=4)
 
 ctk.CTkLabel(left_panel, text="Input Mic -> Virtual Mic").pack(anchor="w", pady=(6, 0))
 input_mics = list_input_mics()
@@ -325,6 +459,17 @@ ctk.CTkCheckBox(
     left_panel, text="Interrupt when pressing keybind again",
     variable=options["interrupt_on_replay"]
 ).pack(anchor="w", pady=(4, 8))
+
+preset_btns = ctk.CTkFrame(left_panel, fg_color=BG)
+preset_btns.pack(fill="x", pady=(0, 8))
+ctk.CTkButton(
+    preset_btns, text="Save Preset",
+    command=lambda: save_preset_dialog()
+).pack(side="left", expand=True, fill="x", padx=(0, 4))
+ctk.CTkButton(
+    preset_btns, text="Load Preset",
+    command=lambda: load_preset_dialog()
+).pack(side="left", expand=True, fill="x")
 
 ctk.CTkButton(left_panel, text="Stop", fg_color=DANGER, command=lambda: stop_all()).pack(pady=8, fill="x")
 
@@ -517,12 +662,130 @@ def update_time():
 
 update_time()
 
+
+def save_preset(path):
+    manifest = {"slots": []}
+    try:
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for slot in sound_slots:
+                entry = {
+                    "id": slot["id"],
+                    "name": slot["name"],
+                    "key": serialize_key(slot["key"]),
+                    "sound_file": None,
+                }
+                if slot["path"] and os.path.exists(slot["path"]):
+                    arcname = f'sounds/{slot["id"]}_{os.path.basename(slot["path"])}'
+                    zf.write(slot["path"], arcname)
+                    entry["sound_file"] = arcname
+                manifest["slots"].append(entry)
+            zf.writestr("manifest.json", json.dumps(manifest, indent=2))
+
+        status.configure(text=f"Preset saved: {os.path.basename(path)}")
+        cfg = load_app_config()
+        cfg["last_preset"] = path
+        save_app_config(cfg)
+    except Exception as e:
+        status.configure(text=f"Failed to save preset: {e}")
+
+def load_preset(path):
+    global sound_slots, _next_slot_id
+
+    if not os.path.exists(path):
+        status.configure(text="Preset file not found")
+        return
+
+    try:
+        extract_dir = os.path.join(PRESET_CACHE_DIR, os.path.splitext(os.path.basename(path))[0])
+        if os.path.exists(extract_dir):
+            shutil.rmtree(extract_dir, ignore_errors=True)
+        os.makedirs(extract_dir, exist_ok=True)
+
+        with zipfile.ZipFile(path, "r") as zf:
+            zf.extractall(extract_dir)
+
+        manifest_path = os.path.join(extract_dir, "manifest.json")
+        with open(manifest_path, "r") as f:
+            manifest = json.load(f)
+
+        for slot in list(sound_slots):
+            stop_slot(slot)
+            if slot["row"] is not None:
+                slot["row"].destroy()
+        sound_slots.clear()
+        key_bindings.clear()
+        _next_slot_id = 0
+
+        for entry in manifest.get("slots", []):
+            _next_slot_id = max(_next_slot_id, entry.get("id", 0))
+            slot = {
+                "id": entry.get("id", _next_slot_id),
+                "name": entry.get("name", "No sound loaded"),
+                "path": "",
+                "sound": None,
+                "key": deserialize_key(entry.get("key")),
+                "channel": None,
+                "mic_stop_event": Event(),
+                "start_time": 0,
+                "length": 0,
+                "label": None,
+                "row": None,
+            }
+            sound_file = entry.get("sound_file")
+            if sound_file:
+                full_path = os.path.join(extract_dir, sound_file)
+                if os.path.exists(full_path):
+                    try:
+                        slot["sound"] = pygame.mixer.Sound(full_path)
+                        slot["path"] = full_path
+                    except Exception:
+                        pass
+            sound_slots.append(slot)
+            make_slot_row(slot)
+
+        if not sound_slots:
+            add_slot()
+
+        rebuild_key_bindings()
+        status.configure(text=f"Preset loaded: {os.path.basename(path)}")
+
+        cfg = load_app_config()
+        cfg["last_preset"] = path
+        save_app_config(cfg)
+    except Exception as e:
+        status.configure(text=f"Failed to load preset: {e}")
+
+def save_preset_dialog():
+    from tkinter import filedialog
+    path = filedialog.asksaveasfilename(
+        defaultextension=PRESET_EXT,
+        filetypes=[("Open Sound Pad Preset", f"*{PRESET_EXT}")]
+    )
+    if not path:
+        return
+    save_preset(path)
+
+def load_preset_dialog():
+    from tkinter import filedialog
+    path = filedialog.askopenfilename(
+        filetypes=[("Open Sound Pad Preset", f"*{PRESET_EXT}")]
+    )
+    if not path:
+        return
+    load_preset(path)
+
+
 def on_key(k):
     slot = key_bindings.get(k)
     if slot:
         play_slot(slot)
 
 keyboard.Listener(on_press=on_key).start()
+
+_startup_cfg = load_app_config()
+_last_preset_path = _startup_cfg.get("last_preset")
+if _last_preset_path and os.path.exists(_last_preset_path):
+    load_preset(_last_preset_path)
 
 def cleanup():
     stop_passthrough_event.set()
